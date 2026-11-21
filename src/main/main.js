@@ -79,7 +79,11 @@ if (enabledFeatures.length > 0) {
 }
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-app.commandLine.appendSwitch('ignore-gpu-blocklist');
+// Forcing the GPU past Chromium's blocklist produced a fully blank window on machines
+// whose driver was blocklisted for exactly this failure mode: the DOM loads fine, the
+// window never paints. The blocklist exists so Chromium can fall back to software
+// rendering there; it also turned on SwiftShader automatically on the broken machine
+// once respected again.
 app.commandLine.appendSwitch('enable-gpu-rasterization');
 app.commandLine.appendSwitch('enable-zero-copy');
 app.commandLine.appendSwitch('renderer-process-limit', '1');
@@ -95,6 +99,28 @@ for (const flag of extraFlags) {
   const eq = flag.indexOf('=');
   if (eq > 0) app.commandLine.appendSwitch(flag.slice(0, eq), flag.slice(eq + 1));
   else app.commandLine.appendSwitch(flag);
+}
+
+// Self-heal blank windows: when the GPU process dies (driver fault), the window stays up
+// with a working DOM but paints nothing. Remember that death and start the next launch on
+// software rendering; a session that stays healthy clears the marker, so a fixed driver
+// quietly returns to hardware rendering.
+const gpuHealthFile = (() => { try { return path.join(app.getPath('userData'), 'gpu-failed.flag'); } catch (e) { return null; } })();
+if (gpuHealthFile && fs.existsSync(gpuHealthFile)) {
+  app.commandLine.appendSwitch('disable-gpu');
+}
+app.on('child-process-gone', (_event, details) => {
+  if (details.type !== 'GPU' || !gpuHealthFile) return;
+  try { fs.writeFileSync(gpuHealthFile, String(Date.now())); } catch (e) {}
+  logger.error(`GPU process gone (${details.reason || 'unknown'}); next launch will use software rendering.`);
+});
+if (gpuHealthFile && fs.existsSync(gpuHealthFile)) {
+  // A session that survives a minute without another GPU death proves the current path is
+  // good — clear the marker so hardware rendering is retried next launch.
+  app.whenReady().then(() => {
+    const grace = setTimeout(() => { try { fs.unlinkSync(gpuHealthFile); } catch (e) {} }, 60000);
+    grace.unref();
+  }).catch(() => {});
 }
 
 if (process.env.MELO_DEBUG === '1') {
